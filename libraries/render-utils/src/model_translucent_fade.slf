@@ -76,7 +76,7 @@ void main(void) {
 
     TransformCamera cam = getTransformCamera();
 
-    _fragColor =  vec4(evalGlobalLightingAlphaBlendedWithHaze(
+    _fragColor =  vec4(evalGlobalLightingAlphaBlended(
         cam._viewInverse,
         1.0,
         occlusionTex,
