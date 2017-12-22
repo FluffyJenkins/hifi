@@ -320,7 +320,7 @@ ModelMeshPartPayload::ModelMeshPartPayload(ModelPointer model, int meshIndex, in
     _shapeID(shapeIndex) {
 
     assert(model && model->isLoaded());
-    _blendedVertexBuffer = model->_blendedVertexBuffers[_meshIndex];
+    _model = model;
     auto& modelMesh = model->getGeometry()->getMeshes().at(_meshIndex);
     const Model::MeshState& state = model->getMeshState(_meshIndex);
 
@@ -334,10 +334,13 @@ ModelMeshPartPayload::ModelMeshPartPayload(ModelPointer model, int meshIndex, in
     }
     updateTransformForSkinnedMesh(renderTransform, transform);
 
-    initCache(model);
+    initCache();
 }
 
-void ModelMeshPartPayload::initCache(const ModelPointer& model) {
+void ModelMeshPartPayload::initCache() {
+    ModelPointer model = _model.lock();
+    assert(model && model->isLoaded());
+
     if (_drawMesh) {
         auto vertexFormat = _drawMesh->getVertexFormat();
         _hasColorAttrib = vertexFormat->hasAttribute(gpu::Stream::COLOR);
@@ -347,7 +350,6 @@ void ModelMeshPartPayload::initCache(const ModelPointer& model) {
         const FBXMesh& mesh = geometry.meshes.at(_meshIndex);
 
         _isBlendShaped = !mesh.blendshapes.isEmpty();
-        _hasTangents = !mesh.tangents.isEmpty();
     }
 
     auto networkMaterial = model->getGeometry()->getShapeMaterial(_shapeID);
@@ -381,55 +383,78 @@ void ModelMeshPartPayload::updateTransformForSkinnedMesh(const Transform& render
     _worldBound.transform(boundTransform);
 }
 
-void ModelMeshPartPayload::setKey(bool isVisible, bool isLayered) {
+ItemKey ModelMeshPartPayload::getKey() const {
     ItemKey::Builder builder;
     builder.withTypeShape();
 
-    if (!isVisible) {
-        builder.withInvisible();
-    }
+    ModelPointer model = _model.lock();
+    if (model) {
+        if (!model->isVisible()) {
+            builder.withInvisible();
+        }
 
-    if (isLayered) {
-        builder.withLayered();
-    }
+        if (model->isLayeredInFront() || model->isLayeredInHUD()) {
+            builder.withLayered();
+        }
 
-    if (_isBlendShaped || _isSkinned) {
-        builder.withDeformed();
-    }
+        if (_isBlendShaped || _isSkinned) {
+            builder.withDeformed();
+        }
 
-    if (_drawMaterial) {
-        auto matKey = _drawMaterial->getKey();
-        if (matKey.isTranslucent()) {
-            builder.withTransparent();
+        if (_drawMaterial) {
+            auto matKey = _drawMaterial->getKey();
+            if (matKey.isTranslucent()) {
+                builder.withTransparent();
+            }
         }
     }
-
-    _itemKey = builder.build();
-}
-
-ItemKey ModelMeshPartPayload::getKey() const {
-    return _itemKey;
-}
-
-void ModelMeshPartPayload::setLayer(bool isLayeredInFront, bool isLayeredInHUD) {
-    if (isLayeredInFront) {
-        _layer = Item::LAYER_3D_FRONT;
-    } else if (isLayeredInHUD) {
-        _layer = Item::LAYER_3D_HUD;
-    } else {
-        _layer = Item::LAYER_3D;
-    }
+    return builder.build();
 }
 
 int ModelMeshPartPayload::getLayer() const {
-    return _layer;
+    ModelPointer model = _model.lock();
+    if (model) {
+        if (model->isLayeredInFront()) {
+            return Item::LAYER_3D_FRONT;
+        } else if (model->isLayeredInHUD()) {
+            return Item::LAYER_3D_HUD;
+        }
+    }
+    return Item::LAYER_3D;
 }
 
-void ModelMeshPartPayload::setShapeKey(bool invalidateShapeKey, bool isWireframe) {
-    if (invalidateShapeKey) {
-        _shapeKey = ShapeKey::Builder::invalid();
-        return;
+ShapeKey ModelMeshPartPayload::getShapeKey() const {
+    // guard against partially loaded meshes
+    ModelPointer model = _model.lock();
+    if (!model || !model->isLoaded() || !model->getGeometry()) {
+        return ShapeKey::Builder::invalid();
     }
+
+    const FBXGeometry& geometry = model->getFBXGeometry();
+    const auto& networkMeshes = model->getGeometry()->getMeshes();
+
+    // guard against partially loaded meshes
+    if (_meshIndex >= (int)networkMeshes.size() || _meshIndex >= (int)geometry.meshes.size() || _meshIndex >= (int)model->_meshStates.size()) {
+        return ShapeKey::Builder::invalid();
+    }
+
+    const FBXMesh& mesh = geometry.meshes.at(_meshIndex);
+
+    // if our index is ever out of range for either meshes or networkMeshes, then skip it, and set our _meshGroupsKnown
+    // to false to rebuild out mesh groups.
+    if (_meshIndex < 0 || _meshIndex >= (int)networkMeshes.size() || _meshIndex > geometry.meshes.size()) {
+        model->_needsFixupInScene = true; // trigger remove/add cycle
+        model->invalidCalculatedMeshBoxes(); // if we have to reload, we need to assume our mesh boxes are all invalid
+        return ShapeKey::Builder::invalid();
+    }
+
+
+    int vertexCount = mesh.vertices.size();
+    if (vertexCount == 0) {
+        // sanity check
+        return ShapeKey::Builder::invalid(); // FIXME
+    }
+
 
     model::MaterialKey drawMaterialKey;
     if (_drawMaterial) {
@@ -437,14 +462,15 @@ void ModelMeshPartPayload::setShapeKey(bool invalidateShapeKey, bool isWireframe
     }
 
     bool isTranslucent = drawMaterialKey.isTranslucent();
-    bool hasTangents = drawMaterialKey.isNormalMap() && _hasTangents;
+    bool hasTangents = drawMaterialKey.isNormalMap() && !mesh.tangents.isEmpty();
     bool hasSpecular = drawMaterialKey.isMetallicMap();
     bool hasLightmap = drawMaterialKey.isLightmapMap();
     bool isUnlit = drawMaterialKey.isUnlit();
 
     bool isSkinned = _isSkinned;
+    bool wireframe = model->isWireframe();
 
-    if (isWireframe) {
+    if (wireframe) {
         isTranslucent = hasTangents = hasSpecular = hasLightmap = isSkinned = false;
     }
 
@@ -469,14 +495,10 @@ void ModelMeshPartPayload::setShapeKey(bool invalidateShapeKey, bool isWireframe
     if (isSkinned) {
         builder.withSkinned();
     }
-    if (isWireframe) {
+    if (wireframe) {
         builder.withWireframe();
     }
-    _shapeKey = builder.build();
-}
-
-ShapeKey ModelMeshPartPayload::getShapeKey() const {
-    return _shapeKey;
+    return builder.build();
 }
 
 void ModelMeshPartPayload::bindMesh(gpu::Batch& batch) {
@@ -488,9 +510,10 @@ void ModelMeshPartPayload::bindMesh(gpu::Batch& batch) {
         batch.setIndexBuffer(gpu::UINT32, (_drawMesh->getIndexBuffer()._buffer), 0);
         batch.setInputFormat((_drawMesh->getVertexFormat()));
 
-        if (_blendedVertexBuffer) {
-            batch.setInputBuffer(0, _blendedVertexBuffer, 0, sizeof(glm::vec3));
-            batch.setInputBuffer(1, _blendedVertexBuffer, _drawMesh->getNumVertices() * sizeof(glm::vec3), sizeof(glm::vec3));
+        ModelPointer model = _model.lock();
+        if (model) {
+            batch.setInputBuffer(0, model->_blendedVertexBuffers[_meshIndex], 0, sizeof(glm::vec3));
+            batch.setInputBuffer(1, model->_blendedVertexBuffers[_meshIndex], _drawMesh->getNumVertices() * sizeof(glm::vec3), sizeof(glm::vec3));
             batch.setInputStream(2, _drawMesh->getVertexStream().makeRangedStream(2));
         } else {
             batch.setIndexBuffer(gpu::UINT32, (_drawMesh->getIndexBuffer()._buffer), 0);
@@ -511,7 +534,29 @@ void ModelMeshPartPayload::bindTransform(gpu::Batch& batch, const ShapePipeline:
 void ModelMeshPartPayload::render(RenderArgs* args) {
     PerformanceTimer perfTimer("ModelMeshPartPayload::render");
 
+    ModelPointer model = _model.lock();
+    if (!model || !model->isAddedToScene() || !model->isVisible()) {
+        return; // bail asap
+    }
+
+    if (_state == WAITING_TO_START) {
+        if (model->isLoaded()) {
+            _state = STARTED;
+            model->setRenderItemsNeedUpdate();
+        } else {
+            return;
+        }
+    }
+
+    if (_materialNeedsUpdate && model->getGeometry()->areTexturesLoaded()) {
+        model->setRenderItemsNeedUpdate();
+        _materialNeedsUpdate = false;
+    }
+
     if (!args) {
+        return;
+    }
+    if (!getShapeKey().isValid()) {
         return;
     }
 

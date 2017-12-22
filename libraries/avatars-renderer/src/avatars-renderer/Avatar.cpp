@@ -138,6 +138,7 @@ Avatar::~Avatar() {
 
 void Avatar::init() {
     getHead()->init();
+    _skeletonModel->init();
     _initialized = true;
 }
 

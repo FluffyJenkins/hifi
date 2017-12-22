@@ -24,6 +24,7 @@ ModelOverlay::ModelOverlay()
     : _model(std::make_shared<Model>(nullptr, this)),
       _modelTextures(QVariantMap())
 {
+    _model->init();
     _model->setLoadingPriority(_loadPriority);
     _isLoaded = false;
 }
@@ -37,6 +38,7 @@ ModelOverlay::ModelOverlay(const ModelOverlay* modelOverlay) :
     _scaleToFit(modelOverlay->_scaleToFit),
     _loadPriority(modelOverlay->_loadPriority)
 {
+    _model->init();
     _model->setLoadingPriority(_loadPriority);
     if (_url.isValid()) {
         _updateModel = true;
